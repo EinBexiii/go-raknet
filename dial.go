@@ -7,11 +7,9 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
-	"sync/atomic"
 	"time"
 
 	"github.com/sandertv/go-raknet/internal"
-
 	"github.com/sandertv/go-raknet/internal/message"
 )
 
@@ -137,7 +135,7 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 	}
 	defer conn.Close()
 
-	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: atomic.AddInt64(&dialerID, 1)}).MarshalBinary()
+	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: randomGUID()}).MarshalBinary()
 	if _, err := conn.Write(data); err != nil {
 		return nil, dialer.error("ping", err)
 	}
@@ -179,8 +177,15 @@ func (dialer Dialer) dial(ctx context.Context, address string) (net.Conn, error)
 	return conn, nil
 }
 
-// dialerID is a counter used to produce an ID for the client.
-var dialerID = rand.Int64()
+// randomGUID generates a fully random GUID for each connection to avoid fingerprinting.
+func randomGUID() int64 {
+	return rand.Int64()
+}
+
+// jitteredDelay returns a duration between 400-600ms to avoid timing fingerprinting.
+func jitteredDelay() time.Duration {
+	return time.Duration(400+rand.IntN(200)) * time.Millisecond
+}
 
 // Dial attempts to dial a RakNet connection to the address passed. The address
 // may be either an IP address or a hostname, combined with a port that is
@@ -221,8 +226,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	}
 	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
-	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), id: atomic.AddInt64(&dialerID, 1), ticker: time.NewTicker(time.Second / 2)}
-	defer cs.ticker.Stop()
+	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), id: randomGUID()}
 	if err = cs.discoverMTU(ctx); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
 	} else if err = cs.openConnection(ctx); err != nil {
@@ -288,8 +292,6 @@ type connState struct {
 
 	serverSecurity bool
 	cookie         uint32
-
-	ticker *time.Ticker
 }
 
 var mtuSizes = []uint16{1492, 1200, 576}
@@ -339,15 +341,15 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	}
 }
 
-// request1 sends a message.OpenConnectionRequest1 three times for each mtu
-// size passed, spaced by 500ms.
+// request1 sends a message.OpenConnectionRequest1 2-4 times for each mtu
+// size passed, spaced by 400-600ms (jittered) to avoid fingerprinting.
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
-	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
-		for range 3 {
+		retries := 2 + rand.IntN(3) // 2-4 retries
+		for range retries {
 			state.openConnectionRequest1(size)
 			select {
-			case <-state.ticker.C:
+			case <-time.After(jitteredDelay()):
 				continue
 			case <-ctx.Done():
 				return
@@ -385,13 +387,12 @@ func (state *connState) openConnection(ctx context.Context) error {
 	}
 }
 
-// request2 continuously sends a message.OpenConnectionRequest2 every 500ms.
+// request2 continuously sends a message.OpenConnectionRequest2 with jittered timing.
 func (state *connState) request2(ctx context.Context, mtu uint16) {
-	state.ticker.Reset(time.Second / 2)
 	for {
 		state.openConnectionRequest2(mtu)
 		select {
-		case <-state.ticker.C:
+		case <-time.After(jitteredDelay()):
 			continue
 		case <-ctx.Done():
 			return
