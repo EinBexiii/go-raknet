@@ -133,6 +133,13 @@ type Dialer struct {
 	// on hosts where the fast no-warmup path is known to fail (e.g. cloud
 	// servers with aggressive anti-DDoS profiles in front of the target).
 	WarmupOnFirstAttempt bool
+
+	// MaxMTU caps the largest OpenConnectionRequest1 probe size emitted
+	// during MTU discovery. The default (0) uses 1492 — fine for paths with
+	// a 1500-byte MTU. Lower this when the local interface has a smaller
+	// MTU (e.g. 1400 due to PPPoE / VPN overhead) so probes don't get
+	// IP-fragmented; many anti-DDoS firewalls silently drop fragmented UDP.
+	MaxMTU uint16
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -346,6 +353,7 @@ func (dialer Dialer) dialOnce(ctx context.Context, address string, warmup time.D
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
 		mtuWarmup:          warmup,
+		maxMTU:             dialer.MaxMTU,
 	}
 	defer cs.ticker.Stop()
 
@@ -418,6 +426,9 @@ type connState struct {
 	// returning, even after a valid Reply1 was received.
 	mtuWarmup time.Duration
 
+	// maxMTU is copied from Dialer.MaxMTU and caps the largest probe size.
+	maxMTU uint16
+
 	serverSecurity bool
 	cookie         uint32
 
@@ -428,6 +439,28 @@ type connState struct {
 }
 
 var mtuSizes = []uint16{1492, 1200, 576}
+
+// mtuSizesFor returns the MTU probe sizes to use for discoverMTU. If the
+// caller configured an explicit MaxMTU on the Dialer, the largest probe is
+// capped to that value (or replaced if it's smaller than 1492). This is
+// useful when the local network path has an MTU below 1500 (e.g. 1400 due to
+// PPPoE/VPN overhead) and the larger probe would be IP-fragmented — many
+// anti-DDoS firewalls silently drop fragmented UDP.
+func mtuSizesFor(maxMTU uint16) []uint16 {
+	if maxMTU == 0 || maxMTU >= 1492 {
+		return mtuSizes
+	}
+	if maxMTU < 576 {
+		return []uint16{maxMTU}
+	}
+	out := []uint16{maxMTU}
+	for _, s := range mtuSizes {
+		if s < maxMTU {
+			out = append(out, s)
+		}
+	}
+	return out
+}
 
 // discoverMTU starts discovering an MTU size, the maximum packet size we
 // can send, by sending multiple open connection request 1 packets to the
@@ -442,7 +475,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go state.request1(ctx, mtuSizes)
+	go state.request1(ctx, mtuSizesFor(state.maxMTU))
 
 	// Capture the original connection deadline so we can restore it after the
 	// warmup window. If we just call SetReadDeadline(time.Time{}) we'd remove
