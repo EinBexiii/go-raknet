@@ -459,7 +459,10 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 		case message.IDOpenConnectionReply1:
 			response := &message.OpenConnectionReply1{}
 			if err := response.UnmarshalBinary(b[1:n]); err != nil {
-				return fmt.Errorf("read open connection reply 1: %w", err)
+				// Some anti-DDoS proxies (notably OVH) occasionally send a
+				// truncated/garbled Reply1. Don't fatal the whole dial; just
+				// drop this packet and keep reading for a valid one.
+				continue
 			}
 			state.serverSecurity, state.cookie = response.ServerHasSecurity, response.Cookie
 			if response.ServerGUID == 0 || response.MTU < 400 || response.MTU > 1500 {
