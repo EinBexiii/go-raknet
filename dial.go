@@ -126,6 +126,12 @@ type Dialer struct {
 	// is fast (no warmup); subsequent attempts use MTUDiscoveryWarmup.
 	// 0 or 1 means a single attempt (current behavior).
 	MaxAttempts int
+
+	// WarmupOnFirstAttempt, if true, applies MTUDiscoveryWarmup already on
+	// the first attempt instead of waiting for the second attempt. Useful
+	// on hosts where the fast no-warmup path is known to fail (e.g. cloud
+	// servers with aggressive anti-DDoS profiles in front of the target).
+	WarmupOnFirstAttempt bool
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -254,11 +260,12 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// First attempt: no warmup (fast path that works for most servers).
-		// Subsequent attempts: use the configured warmup, in case the server
-		// silently dropped Reply2 due to anti-DDoS rules.
+		// First attempt: no warmup (fast path that works for most servers)
+		// unless WarmupOnFirstAttempt is set. Subsequent attempts always use
+		// the configured warmup, in case the server silently dropped Reply2
+		// due to anti-DDoS rules.
 		warmup := time.Duration(0)
-		if attempt > 0 {
+		if attempt > 0 || dialer.WarmupOnFirstAttempt {
 			warmup = dialer.MTUDiscoveryWarmup
 		}
 
