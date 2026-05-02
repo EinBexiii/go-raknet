@@ -107,8 +107,7 @@ type Dialer struct {
 	MaxTransientErrors int
 
 	// MaxMTU caps the largest MTU value used during the connection
-	// handshake. The default (0) keeps the existing behaviour: probes start
-	// at 1492 bytes and the negotiated MTU may go up to 1500.
+	// handshake. If zero, probes start at the maximum supported MTU.
 	//
 	// Set this to your local interface MTU when it is below 1500 (for
 	// example 1400 on hosts behind a tunnel or VPN). With the default,
@@ -162,7 +161,7 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 		return nil, dialer.error("ping", err)
 	}
 
-	data = make([]byte, 1492)
+	data = make([]byte, maxMTUSize)
 	n, err := conn.Read(data)
 	if err != nil {
 		return nil, dialer.error("ping", err)
@@ -329,18 +328,19 @@ type connState struct {
 	maxTransientErrors  int
 }
 
-var mtuSizes = []uint16{1492, 1200, 576}
+const minSupportedMTU = 576
+
+// mtuSizes is the default probe sequence used for MTU discovery.
+var mtuSizes = []uint16{maxMTUSize, 1200, minSupportedMTU}
 
 // mtuSizesFor returns the MTU values to probe with when starting a
-// connection. If maxMTU is zero or already at least 1492, the unmodified
+// connection. If maxMTU is zero or already at least maxMTUSize, the unmodified
 // default list is returned. Otherwise the largest entry is replaced with
 // maxMTU and any default entries that are still smaller are kept after it.
 func mtuSizesFor(maxMTU uint16) []uint16 {
-	if maxMTU == 0 || maxMTU >= 1492 {
+	maxMTU = clampMTU(maxMTU, minSupportedMTU)
+	if maxMTU == maxMTUSize {
 		return mtuSizes
-	}
-	if maxMTU < 576 {
-		return []uint16{maxMTU}
 	}
 	out := []uint16{maxMTU}
 	for _, s := range mtuSizes {
@@ -360,7 +360,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 
 	go state.request1(ctx, mtuSizesFor(state.maxMTU))
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find an open connection reply
 		// 1 packet.
@@ -428,7 +428,7 @@ func (state *connState) openConnection(ctx context.Context) error {
 
 	go state.request2(ctx, state.mtu)
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find open connection reply 2
 		// packets.
