@@ -413,8 +413,11 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	}
 }
 
-// request1 sends a message.OpenConnectionRequest1 three times for each mtu
-// size passed, spaced by 500ms.
+// request1 sends a message.OpenConnectionRequest1 four times for each mtu
+// size passed, spaced by 500ms. When state.mtuWarmup is non-zero, request1
+// keeps re-sending probes (cycling through the smallest MTU) until ctx is
+// cancelled, so the warmup window in discoverMTU can rely on a continuous
+// stream of probes to train anti-DDoS proxies.
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
@@ -426,6 +429,20 @@ func (state *connState) request1(ctx context.Context, sizes []uint16) {
 			case <-ctx.Done():
 				return
 			}
+		}
+	}
+	if state.mtuWarmup <= 0 {
+		return
+	}
+	// Continue probing with the smallest MTU until ctx is cancelled.
+	smallest := sizes[len(sizes)-1]
+	for {
+		state.openConnectionRequest1(smallest)
+		select {
+		case <-state.ticker.C:
+			continue
+		case <-ctx.Done():
+			return
 		}
 	}
 }
