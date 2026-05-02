@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sandertv/go-raknet/internal"
@@ -300,8 +301,33 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		if ctx.Err() != nil {
 			return nil, dialer.error("dial", ctx.Err())
 		}
+		// If the kernel reported ICMP "Port Unreachable" / hard reject the
+		// server is genuinely not listening on this 5-tuple. Retrying with a
+		// new socket would only generate more traffic that anti-DDoS systems
+		// on the path can latch onto. Bail out immediately.
+		if isHardRejectError(err) {
+			return nil, lastErr
+		}
 	}
 	return nil, lastErr
+}
+
+// isHardRejectError reports whether err is a kernel-side hard reject like
+// ECONNREFUSED that we should NOT retry on.
+func isHardRejectError(err error) bool {
+	for err != nil {
+		if errno, ok := err.(syscall.Errno); ok {
+			if errno == syscall.ECONNREFUSED {
+				return true
+			}
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
 }
 
 // dialOnce performs a single dial attempt with the given MTU-discovery warmup.
