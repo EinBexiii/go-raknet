@@ -411,6 +411,12 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 
 	go state.request1(ctx, mtuSizes)
 
+	// Capture the original connection deadline so we can restore it after the
+	// warmup window. If we just call SetReadDeadline(time.Time{}) we'd remove
+	// the outer ctx's deadline entirely and openConnection() could block
+	// forever waiting for a Reply2 that never arrives.
+	origDeadline, _ := ctx.Deadline()
+
 	var (
 		warmupDeadline time.Time
 		haveValid      bool
@@ -427,8 +433,9 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 		n, err := state.conn.Read(b)
 		if err != nil {
 			if haveValid && os.IsTimeout(err) {
-				// Warmup window elapsed and we already have a valid Reply1 — proceed.
-				_ = state.conn.SetReadDeadline(time.Time{})
+				// Warmup window elapsed and we already have a valid Reply1 —
+				// restore the original (ctx) deadline and proceed.
+				_ = state.conn.SetReadDeadline(origDeadline)
 				return nil
 			}
 			if isTransientUDPReadError(err) && (state.maxTransientErrors == -1 || state.transientErrorCount < state.maxTransientErrors) {
