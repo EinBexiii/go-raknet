@@ -114,10 +114,18 @@ type Dialer struct {
 	//
 	// This works around servers behind Cloudflare Spectrum (and similar UDP
 	// anti-DDoS proxies) that silently drop the OpenConnectionReply2 packet
-	// for a "first contact" 5-tuple — the session is only treated as trusted
-	// once several round-trips on the same source IP / source port have been
-	// observed. A value around 1500ms reliably trains the proxy.
+	// for a "first contact" 5-tuple. A value around 1500ms reliably trains
+	// the proxy. The warmup is only used on retries when MaxAttempts > 1;
+	// the first attempt is always made without a warmup so that "good"
+	// servers connect quickly.
 	MTUDiscoveryWarmup time.Duration
+
+	// MaxAttempts is the maximum number of dial attempts to make. Each
+	// attempt opens a fresh UDP socket (giving the kernel a new ephemeral
+	// source port) and tries the full RakNet handshake. The first attempt
+	// is fast (no warmup); subsequent attempts use MTUDiscoveryWarmup.
+	// 0 or 1 means a single attempt (current behavior).
+	MaxAttempts int
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -239,12 +247,40 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	if dialer.MaxTransientErrors == 0 {
 		dialer.MaxTransientErrors = 10
 	}
+	maxAttempts := dialer.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
 
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// First attempt: no warmup (fast path that works for most servers).
+		// Subsequent attempts: use the configured warmup, in case the server
+		// silently dropped Reply2 due to anti-DDoS rules.
+		warmup := time.Duration(0)
+		if attempt > 0 {
+			warmup = dialer.MTUDiscoveryWarmup
+		}
+		conn, err := dialer.dialOnce(ctx, address, warmup)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, dialer.error("dial", ctx.Err())
+		}
+	}
+	return nil, lastErr
+}
+
+// dialOnce performs a single dial attempt with the given MTU-discovery warmup.
+// On any failure, the underlying UDP connection has already been closed.
+func (dialer Dialer) dialOnce(ctx context.Context, address string, warmup time.Duration) (*Conn, error) {
 	conn, err := dialer.dial(ctx, address)
 	if err != nil {
 		return nil, dialer.error("dial", err)
 	}
-	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
+	log := dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
 	cs := &connState{
 		conn:               conn,
@@ -252,15 +288,18 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		id:                 atomic.AddInt64(&dialerID, 1),
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
-		mtuWarmup:          dialer.MTUDiscoveryWarmup,
+		mtuWarmup:          warmup,
 	}
 	defer cs.ticker.Stop()
+
+	d := dialer
+	d.ErrorLog = log
 	if err = cs.discoverMTU(ctx); err != nil {
-		return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
+		return nil, d.error("dial", fmt.Errorf("discover mtu: %w", err))
 	} else if err = cs.openConnection(ctx); err != nil {
-		return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
+		return nil, d.error("dial", fmt.Errorf("open connection: %w", err))
 	}
-	return dialer.connect(ctx, cs)
+	return d.connect(ctx, cs)
 }
 
 // dial finishes the RakNet connection sequence and returns a Conn if
