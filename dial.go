@@ -97,6 +97,14 @@ type Dialer struct {
 	// UpstreamDialer is a dialer that will override the default dialer for
 	// opening outgoing connections. The default is a net.Dial("udp", ...).
 	UpstreamDialer UpstreamDialer
+
+	// MaxTransientErrors is the maximum number of transient errors to ignore
+	// before returning an error. These include errors that can occur on
+	// bad connections such as ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ECONNRESET.
+	// If there is no limit it will continue to retry reading until the context deadline.
+	// Default is 10. -1 means no limit.
+	// This is only used for the initial connection handshake.
+	MaxTransientErrors int
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -180,7 +188,8 @@ func (dialer Dialer) dial(ctx context.Context, address string) (net.Conn, error)
 }
 
 // dialerID is a counter used to produce an ID for the client.
-var dialerID = rand.Int64()
+// This should always be negative as per the vanilla client implementation.
+var dialerID = -rand.Int64()
 
 // Dial attempts to dial a RakNet connection to the address passed. The address
 // may be either an IP address or a hostname, combined with a port that is
@@ -214,6 +223,9 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	if dialer.ErrorLog == nil {
 		dialer.ErrorLog = slog.New(internal.DiscardHandler{})
 	}
+	if dialer.MaxTransientErrors == 0 {
+		dialer.MaxTransientErrors = 10
+	}
 
 	conn, err := dialer.dial(ctx, address)
 	if err != nil {
@@ -221,14 +233,19 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	}
 	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
-	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), id: atomic.AddInt64(&dialerID, 1), ticker: time.NewTicker(time.Second / 2)}
+	cs := &connState{
+		conn:               conn,
+		raddr:              conn.RemoteAddr(),
+		id:                 atomic.AddInt64(&dialerID, 1),
+		ticker:             time.NewTicker(time.Second / 2),
+		maxTransientErrors: dialer.MaxTransientErrors,
+	}
 	defer cs.ticker.Stop()
 	if err = cs.discoverMTU(ctx); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
 	} else if err = cs.openConnection(ctx); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
 	}
-
 	return dialer.connect(ctx, cs)
 }
 
@@ -290,6 +307,9 @@ type connState struct {
 	cookie         uint32
 
 	ticker *time.Ticker
+
+	transientErrorCount int
+	maxTransientErrors  int
 }
 
 var mtuSizes = []uint16{1492, 1200, 576}
@@ -308,9 +328,16 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 		// Start reading in a loop so that we can find an open connection reply
 		// 1 packet.
 		n, err := state.conn.Read(b)
-		if err != nil || n == 0 {
+		if err != nil {
+			if isTransientUDPReadError(err) && (state.maxTransientErrors == -1 || state.transientErrorCount < state.maxTransientErrors) {
+				state.transientErrorCount++
+				continue
+			}
 			state.close()
 			return err
+		}
+		if n == 0 {
+			continue
 		}
 		switch b[0] {
 		case message.IDOpenConnectionReply1:
@@ -344,7 +371,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
-		for range 3 {
+		for range 4 {
 			state.openConnectionRequest1(size)
 			select {
 			case <-state.ticker.C:
@@ -369,9 +396,16 @@ func (state *connState) openConnection(ctx context.Context) error {
 		// Start reading in a loop so that we can find open connection reply 2
 		// packets.
 		n, err := state.conn.Read(b)
-		if err != nil || n == 0 {
+		if err != nil {
+			if isTransientUDPReadError(err) && (state.maxTransientErrors == -1 || state.transientErrorCount < state.maxTransientErrors) {
+				state.transientErrorCount++
+				continue
+			}
 			state.close()
 			return err
+		}
+		if n == 0 {
+			continue
 		}
 		if b[0] != message.IDOpenConnectionReply2 {
 			continue
