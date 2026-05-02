@@ -13,18 +13,34 @@ type OpenConnectionReply1 struct {
 }
 
 func (pk *OpenConnectionReply1) UnmarshalBinary(data []byte) error {
-	var offset int
-	if len(data) < 27 || len(data) < 27+int(data[24])*4 {
+	if len(data) < 27 {
 		return io.ErrUnexpectedEOF
 	}
 	// Magic: 16 bytes.
 	pk.ServerGUID = int64(binary.BigEndian.Uint64(data[16:]))
-	pk.ServerHasSecurity = data[24] != 0
-	if pk.ServerHasSecurity {
-		offset = 4
+
+	// Some anti-DDoS proxies (notably OVH) send a Reply1 with garbage in the
+	// useSecurity / cookie / MTU fields as a challenge. We treat any value
+	// other than 0 or 1 in data[24] as "security disabled" and parse the MTU
+	// from the next two bytes — this lets the caller treat the packet as a
+	// (broken) Reply1 and trigger its OVH workaround instead of failing.
+	switch data[24] {
+	case 0:
+		pk.ServerHasSecurity = false
+		pk.MTU = binary.BigEndian.Uint16(data[25:])
+	case 1:
+		pk.ServerHasSecurity = true
+		if len(data) < 31 {
+			return io.ErrUnexpectedEOF
+		}
 		pk.Cookie = binary.BigEndian.Uint32(data[25:29])
+		pk.MTU = binary.BigEndian.Uint16(data[29:])
+	default:
+		// Garbage useSecurity byte. Best-effort decode so the dialer can
+		// recognise the packet as a broken Reply1.
+		pk.ServerHasSecurity = false
+		pk.MTU = binary.BigEndian.Uint16(data[25:])
 	}
-	pk.MTU = binary.BigEndian.Uint16(data[25+offset:])
 	return nil
 }
 
