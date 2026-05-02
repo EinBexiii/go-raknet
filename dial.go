@@ -261,7 +261,31 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		if attempt > 0 {
 			warmup = dialer.MTUDiscoveryWarmup
 		}
-		conn, err := dialer.dialOnce(ctx, address, warmup)
+
+		// Carve out a per-attempt timeout from the remaining ctx-deadline so
+		// no single attempt can swallow all available time.
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		if d, ok := ctx.Deadline(); ok {
+			remaining := time.Until(d)
+			if remaining <= 0 {
+				return nil, dialer.error("dial", ctx.Err())
+			}
+			share := remaining / time.Duration(maxAttempts-attempt)
+			minPerAttempt := warmup + 4*time.Second
+			if share < minPerAttempt {
+				share = minPerAttempt
+			}
+			if share > remaining {
+				share = remaining
+			}
+			attemptCtx, cancel = context.WithTimeout(ctx, share)
+		}
+
+		conn, err := dialer.dialOnce(attemptCtx, address, warmup)
+		if cancel != nil {
+			cancel()
+		}
 		if err == nil {
 			return conn, nil
 		}
