@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -105,6 +106,18 @@ type Dialer struct {
 	// Default is 10. -1 means no limit.
 	// This is only used for the initial connection handshake.
 	MaxTransientErrors int
+
+	// MTUDiscoveryWarmup, if non-zero, makes discoverMTU keep sending
+	// OpenConnectionRequest1 probes for at least this duration before moving
+	// on to the OpenConnectionRequest2 stage, even after a valid Reply1 has
+	// been received.
+	//
+	// This works around servers behind Cloudflare Spectrum (and similar UDP
+	// anti-DDoS proxies) that silently drop the OpenConnectionReply2 packet
+	// for a "first contact" 5-tuple — the session is only treated as trusted
+	// once several round-trips on the same source IP / source port have been
+	// observed. A value around 1500ms reliably trains the proxy.
+	MTUDiscoveryWarmup time.Duration
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -239,6 +252,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		id:                 atomic.AddInt64(&dialerID, 1),
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
+		mtuWarmup:          dialer.MTUDiscoveryWarmup,
 	}
 	defer cs.ticker.Stop()
 	if err = cs.discoverMTU(ctx); err != nil {
@@ -303,6 +317,11 @@ type connState struct {
 	// 1 packet. It is the MTU size sent by the server.
 	mtu uint16
 
+	// mtuWarmup is copied from Dialer.MTUDiscoveryWarmup. When non-zero,
+	// discoverMTU keeps sending probes for at least this duration before
+	// returning, even after a valid Reply1 was received.
+	mtuWarmup time.Duration
+
 	serverSecurity bool
 	cookie         uint32
 
@@ -317,18 +336,38 @@ var mtuSizes = []uint16{1492, 1200, 576}
 // discoverMTU starts discovering an MTU size, the maximum packet size we
 // can send, by sending multiple open connection request 1 packets to the
 // server with a decreasing MTU size padding.
+//
+// If state.mtuWarmup is non-zero, discoverMTU keeps reading probes for at
+// least that duration after the first valid Reply1, repeatedly storing the
+// freshest cookie/MTU. This is needed for servers behind UDP anti-DDoS
+// proxies (e.g. Cloudflare Spectrum) that drop the OpenConnectionReply2
+// packet for "first contact" 5-tuples.
 func (state *connState) discoverMTU(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go state.request1(ctx, mtuSizes)
 
+	var (
+		warmupDeadline time.Time
+		haveValid      bool
+	)
+
 	b := make([]byte, 1492)
 	for {
 		// Start reading in a loop so that we can find an open connection reply
 		// 1 packet.
+		if haveValid && !warmupDeadline.IsZero() {
+			// Cap the read deadline at the warmup deadline so we exit when warmup ends.
+			_ = state.conn.SetReadDeadline(warmupDeadline)
+		}
 		n, err := state.conn.Read(b)
 		if err != nil {
+			if haveValid && os.IsTimeout(err) {
+				// Warmup window elapsed and we already have a valid Reply1 — proceed.
+				_ = state.conn.SetReadDeadline(time.Time{})
+				return nil
+			}
 			if isTransientUDPReadError(err) && (state.maxTransientErrors == -1 || state.transientErrorCount < state.maxTransientErrors) {
 				state.transientErrorCount++
 				continue
@@ -355,7 +394,15 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				continue
 			}
 			state.mtu = response.MTU
-			return nil
+			if state.mtuWarmup <= 0 {
+				return nil
+			}
+			if !haveValid {
+				warmupDeadline = time.Now().Add(state.mtuWarmup)
+				haveValid = true
+			}
+			// Keep reading more probes to satisfy the warmup window.
+			continue
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}
 			if err := response.UnmarshalBinary(b[1:n]); err != nil {
