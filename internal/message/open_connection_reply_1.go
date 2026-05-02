@@ -36,10 +36,16 @@ func (pk *OpenConnectionReply1) UnmarshalBinary(data []byte) error {
 		pk.Cookie = binary.BigEndian.Uint32(data[25:29])
 		pk.MTU = binary.BigEndian.Uint16(data[29:])
 	default:
-		// Garbage useSecurity byte. Best-effort decode so the dialer can
-		// recognise the packet as a broken Reply1.
-		pk.ServerHasSecurity = false
-		pk.MTU = binary.BigEndian.Uint16(data[25:])
+		// Garbage useSecurity byte (OVH-style anti-DDoS challenge).
+		// Treat the packet as if security were enabled and parse the
+		// cookie + MTU from the next bytes, so the dialer can echo the
+		// challenge back in OpenConnectionRequest2.
+		pk.ServerHasSecurity = true
+		if len(data) < 31 {
+			return io.ErrUnexpectedEOF
+		}
+		pk.Cookie = binary.BigEndian.Uint32(data[25:29])
+		pk.MTU = binary.BigEndian.Uint16(data[29:])
 	}
 	return nil
 }
