@@ -134,11 +134,15 @@ type Dialer struct {
 	// servers with aggressive anti-DDoS profiles in front of the target).
 	WarmupOnFirstAttempt bool
 
-	// MaxMTU caps the largest OpenConnectionRequest1 probe size emitted
-	// during MTU discovery. The default (0) uses 1492 — fine for paths with
-	// a 1500-byte MTU. Lower this when the local interface has a smaller
-	// MTU (e.g. 1400 due to PPPoE / VPN overhead) so probes don't get
-	// IP-fragmented; many anti-DDoS firewalls silently drop fragmented UDP.
+	// MaxMTU caps the largest MTU value used during the connection
+	// handshake. If zero, probes start at the maximum supported MTU.
+	//
+	// Set this to your local interface MTU when it is below 1500 (for
+	// example 1400 on hosts behind a tunnel or VPN). With the default,
+	// the kernel will fragment the first probes into two IP packets, and
+	// some firewalls drop fragmented UDP and never deliver them to the
+	// server. Capping the MTU keeps every packet inside a single IP
+	// datagram for the entire connection.
 	MaxMTU uint16
 }
 
@@ -185,7 +189,7 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 		return nil, dialer.error("ping", err)
 	}
 
-	data = make([]byte, 1492)
+	data = make([]byte, maxMTUSize)
 	n, err := conn.Read(data)
 	if err != nil {
 		return nil, dialer.error("ping", err)
@@ -393,7 +397,7 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 	// Create a buffer with the maximum size a UDP packet sent over RakNet is
 	// allowed to have. We can re-use this buffer for each packet.
-	b := make([]byte, rakConn.effectiveMTU())
+	b := make([]byte, maxMTUSize)
 	for {
 		n, err := conn.Read(b)
 		if err == nil && n != 0 {
@@ -426,7 +430,8 @@ type connState struct {
 	// returning, even after a valid Reply1 was received.
 	mtuWarmup time.Duration
 
-	// maxMTU is copied from Dialer.MaxMTU and caps the largest probe size.
+	// maxMTU is copied from Dialer.MaxMTU and caps the probe sizes used
+	// during MTU discovery. Zero means use the defaults.
 	maxMTU uint16
 
 	serverSecurity bool
@@ -438,20 +443,19 @@ type connState struct {
 	maxTransientErrors  int
 }
 
-var mtuSizes = []uint16{1492, 1200, 576}
+const minSupportedMTU = 576
 
-// mtuSizesFor returns the MTU probe sizes to use for discoverMTU. If the
-// caller configured an explicit MaxMTU on the Dialer, the largest probe is
-// capped to that value (or replaced if it's smaller than 1492). This is
-// useful when the local network path has an MTU below 1500 (e.g. 1400 due to
-// PPPoE/VPN overhead) and the larger probe would be IP-fragmented — many
-// anti-DDoS firewalls silently drop fragmented UDP.
+// mtuSizes is the default probe sequence used for MTU discovery.
+var mtuSizes = []uint16{maxMTUSize, 1200, minSupportedMTU}
+
+// mtuSizesFor returns the MTU values to probe with when starting a
+// connection. If maxMTU is zero or already at least maxMTUSize, the unmodified
+// default list is returned. Otherwise the largest entry is replaced with
+// maxMTU and any default entries that are still smaller are kept after it.
 func mtuSizesFor(maxMTU uint16) []uint16 {
-	if maxMTU == 0 || maxMTU >= 1492 {
+	maxMTU = clampMTU(maxMTU, minSupportedMTU)
+	if maxMTU == maxMTUSize {
 		return mtuSizes
-	}
-	if maxMTU < 576 {
-		return []uint16{maxMTU}
 	}
 	out := []uint16{maxMTU}
 	for _, s := range mtuSizes {
@@ -488,7 +492,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 		haveValid      bool
 	)
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find an open connection reply
 		// 1 packet.
@@ -594,7 +598,7 @@ func (state *connState) openConnection(ctx context.Context) error {
 
 	go state.request2(ctx, state.mtu)
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find open connection reply 2
 		// packets.
