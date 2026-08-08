@@ -560,9 +560,11 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	}
 	m[p.splitIndex] = p.content
 
-	if slices.ContainsFunc(m, func(i []byte) bool { return len(i) == 0 }) {
+	if slices.ContainsFunc(m, func(i []byte) bool { return i == nil }) {
 		// We haven't yet received all split fragments, so we cannot add the
-		// packets together yet.
+		// packets together yet. Fragments that were received are never nil,
+		// because packet.read always allocates their content, so a fragment
+		// with a zero length is still recognised as received here.
 		return nil
 	}
 	p.content = slices.Concat(m...)

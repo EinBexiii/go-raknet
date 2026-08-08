@@ -126,7 +126,11 @@ func (pk *packet) read(b []byte) (int, error) {
 	pk.reliability = reliability((header & 224) >> 5)
 
 	n := binary.BigEndian.Uint16(b[1:]) >> 3
-	if n == 0 {
+	if n == 0 && !pk.split {
+		// A zero length is only meaningful for a fragment: some servers split
+		// every packet in two, leaving the first fragment of a one byte packet
+		// empty. A packet that is not split carries no data at all if its
+		// length is zero, so it is still rejected.
 		return 0, errors.New("invalid packet length: cannot be 0")
 	}
 	offset := 3
